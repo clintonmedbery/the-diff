@@ -125,7 +125,7 @@ impl App {
                     self.diff_scroll = 0;
                 }
             }
-            Focus::Diff => self.hunk_up(),
+            Focus::Diff => {}
         }
     }
 
@@ -151,7 +151,7 @@ impl App {
                     self.diff_scroll = 0;
                 }
             }
-            Focus::Diff => self.hunk_down(),
+            Focus::Diff => {}
         }
     }
 

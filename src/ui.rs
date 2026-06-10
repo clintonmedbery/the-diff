@@ -119,12 +119,29 @@ fn render_file_panel(
         })
     };
 
-    let full_title = format!("{title}({}) ", files.len());
+    let added: usize = files.iter()
+        .flat_map(|f| &f.hunks)
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind == LineKind::Added)
+        .count();
+    let removed: usize = files.iter()
+        .flat_map(|f| &f.hunks)
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind == LineKind::Removed)
+        .count();
+
+    let title_line = Line::from(vec![
+        Span::raw(format!("{title}({})  ", files.len())),
+        Span::styled(format!("+{added}"), Style::default().fg(Color::Rgb(100, 210, 100))),
+        Span::raw(" "),
+        Span::styled(format!("-{removed}"), Style::default().fg(Color::Rgb(210, 90, 90))),
+        Span::raw(" "),
+    ]);
 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(full_title)
+                .title(title_line)
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
@@ -282,9 +299,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Focus::Staged =>
             " Tab:cycle  ↑↓/jk:nav  u:unstage file  Enter:diff  r:reload  q:quit",
         Focus::Diff if app.diff_source == DiffSource::Staged =>
-            " Tab:panel  ↑↓/jk:hunk  u:unstage hunk  U:unstage file  r:reload  q:quit",
+            " Tab:panel  ↑↓/jk:scroll  []:hunk  u:unstage hunk  U:unstage file  r:reload  q:quit",
         Focus::Diff =>
-            " Tab:panel  ↑↓/jk:hunk  s:stage hunk  S:stage file  d:discard hunk  D:discard file  r:reload  q:quit",
+            " Tab:panel  ↑↓/jk:scroll  []:hunk  s:stage hunk  S:stage file  d:discard hunk  D:discard file  r:reload  q:quit",
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::Rgb(70, 70, 70))),

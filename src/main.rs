@@ -2,12 +2,12 @@ mod app;
 mod git;
 mod ui;
 
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
-use app::App;
+use app::{App, Focus};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -43,19 +43,40 @@ fn run(
     repo_path: PathBuf,
 ) -> Result<()> {
     let mut app = App::new(repo_path)?;
+    let mut last_reload = Instant::now();
+    const AUTO_RELOAD: Duration = Duration::from_secs(10);
 
     loop {
         terminal.draw(|f| ui::render(f, &app))?;
 
         if !event::poll(Duration::from_millis(200))? {
+            if last_reload.elapsed() >= AUTO_RELOAD {
+                app.reload();
+                last_reload = Instant::now();
+            }
             continue;
         }
 
-        if let Event::Key(key) = event::read()? {
-            let diff_height = terminal
-                .size()
-                .map(|s| s.height.saturating_sub(4) as usize)
-                .unwrap_or(20);
+        let ev = event::read()?;
+
+        let diff_height = terminal
+            .size()
+            .map(|s| s.height.saturating_sub(4) as usize)
+            .unwrap_or(20);
+
+        // Mouse scroll anywhere in the window scrolls the diff panel
+        if let Event::Mouse(mouse) = ev {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.scroll_up(),
+                MouseEventKind::ScrollDown => app.scroll_down(diff_height),
+                _ => {}
+            }
+            if app.should_quit { break; }
+            continue;
+        }
+
+        if let Event::Key(key) = ev {
+            let diff_height = diff_height; // already computed above
 
             match key.code {
                 // Quit
@@ -69,11 +90,27 @@ fn run(
                 KeyCode::Enter => app.enter_diff(),
                 KeyCode::Esc => app.exit_diff(),
 
-                // Navigation
-                KeyCode::Up | KeyCode::Char('k') => app.file_up(),
-                KeyCode::Down | KeyCode::Char('j') => app.file_down(),
+                // Navigation — line scroll in diff, file nav in list panels
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if app.focus == Focus::Diff {
+                        app.scroll_up();
+                    } else {
+                        app.file_up();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if app.focus == Focus::Diff {
+                        app.scroll_down(diff_height);
+                    } else {
+                        app.file_down();
+                    }
+                }
 
-                // Diff scrolling (fine-grained, no hunk change)
+                // Hunk jumping within the diff panel
+                KeyCode::Char('[') => app.hunk_up(),
+                KeyCode::Char(']') => app.hunk_down(),
+
+                // Page scroll
                 KeyCode::PageUp => {
                     for _ in 0..diff_height / 2 { app.scroll_up(); }
                 }
@@ -82,7 +119,7 @@ fn run(
                 }
 
                 // Reload
-                KeyCode::Char('r') => app.reload(),
+                KeyCode::Char('r') => { app.reload(); last_reload = Instant::now(); }
 
                 // s/S: stage (unstaged context only)
                 KeyCode::Char('s') => app.stage_action(),
