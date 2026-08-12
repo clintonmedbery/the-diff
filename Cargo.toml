@@ -1,6 +1,6 @@
 [package]
 name = "the-diff"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A terminal UI for staging, unstaging, and discarding git changes hunk by hunk"
 license = "MIT OR Apache-2.0"
