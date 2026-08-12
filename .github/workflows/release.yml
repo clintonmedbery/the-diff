@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Idempotent so the workflow can be re-run against an existing tag
       # without failing on "release already exists".
@@ -52,7 +52,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # No-op when the target is already native to the runner.
       - name: Add target
