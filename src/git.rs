@@ -121,9 +121,8 @@ fn parse_diff(input: &str) -> Vec<ChangedFile> {
             || line.starts_with("new mode")
             || line.starts_with("similarity")
             || line.starts_with("rename")
+            || line.starts_with("--- ")
         {
-            header_buf.push(line.to_string());
-        } else if line.starts_with("--- ") {
             header_buf.push(line.to_string());
         } else if line.starts_with("+++ ") {
             header_buf.push(line.to_string());
@@ -330,4 +329,96 @@ fn apply_patch(repo_path: &Path, patch: &str, extra_args: &[&str]) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"diff --git a/src/main.rs b/src/main.rs
+index 1234567..89abcde 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+-    println!("old");
++    println!("new");
++    // added
+ }
+@@ -10,2 +11,2 @@ fn helper() {
+-    let a = 1;
++    let a = 2;
+"#;
+
+    #[test]
+    fn parses_one_file_with_two_hunks() {
+        let files = parse_diff(SAMPLE);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[0].hunks.len(), 2);
+        assert_eq!(files[0].kind, FileKind::Modified);
+    }
+
+    #[test]
+    fn classifies_line_kinds() {
+        let files = parse_diff(SAMPLE);
+        let first = &files[0].hunks[0];
+        let count = |k: LineKind| first.lines.iter().filter(|l| l.kind == k).count();
+        assert_eq!(
+            (count(LineKind::Added), count(LineKind::Removed), count(LineKind::Context)),
+            (2, 1, 2)
+        );
+    }
+
+    #[test]
+    fn header_is_captured_so_patches_can_be_rebuilt() {
+        let files = parse_diff(SAMPLE);
+        assert!(files[0].header.starts_with("diff --git a/src/main.rs b/src/main.rs"));
+        assert!(files[0].header.contains("+++ b/src/main.rs"));
+    }
+
+    #[test]
+    fn hunk_ranges_are_parsed() {
+        assert_eq!(parse_hunk_range("@@ -1,3 +1,4 @@"), (1, 1));
+        assert_eq!(parse_hunk_range("@@ -10,2 +11,2 @@ fn helper() {"), (10, 11));
+        // Single-line hunks omit the count
+        assert_eq!(parse_hunk_range("@@ -5 +7 @@"), (5, 7));
+    }
+
+    #[test]
+    fn b_path_is_extracted() {
+        assert_eq!(extract_b_path("+++ b/src/foo.rs"), "src/foo.rs");
+        assert_eq!(extract_b_path("+++ /dev/null"), "/dev/null");
+    }
+
+    #[test]
+    fn no_newline_marker_is_its_own_kind() {
+        let diff = r"diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old
++new
+\ No newline at end of file
+";
+        let files = parse_diff(diff);
+        let last = files[0].hunks[0].lines.last().map(|l| l.kind.clone());
+        assert_eq!(last, Some(LineKind::NoNewline));
+    }
+
+    #[test]
+    fn empty_diff_yields_no_files() {
+        assert!(parse_diff("").is_empty());
+    }
+
+    #[test]
+    fn build_patch_emits_only_the_requested_hunk() {
+        let files = parse_diff(SAMPLE);
+        let patch = build_patch(&files[0], 1);
+        assert!(patch.starts_with("diff --git"));
+        assert!(patch.contains("@@ -10,2 +11,2 @@"));
+        // The first hunk's contents must not leak in
+        assert!(!patch.contains("println!"));
+        assert!(patch.ends_with('\n'));
+    }
 }
