@@ -3,10 +3,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::{App, DiffSource, Focus};
+use crate::app::{App, DiffSource, Focus, Pending};
 use crate::git::{FileKind, LineKind};
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -43,6 +43,64 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_diff(frame, app, main[1]);
     render_footer(frame, app, outer[1]);
+
+    // Drawn last so it sits above every panel
+    if let Some(pending) = &app.pending {
+        render_confirm(frame, pending, area);
+    }
+}
+
+/// Centre a `width` x `height` box inside `area`, shrinking to fit if needed.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn render_confirm(frame: &mut Frame, pending: &Pending, area: Rect) {
+    const DANGER: Color = Color::Rgb(210, 90, 90);
+
+    let widest = pending.lines.iter().map(|l| l.len()).max().unwrap_or(0);
+    // Body + blank line + key hints, plus borders and horizontal padding
+    let width = (widest.max(34) + 6) as u16;
+    let height = (pending.lines.len() + 4) as u16;
+
+    let mut body: Vec<Line> = Vec::new();
+    for line in &pending.lines {
+        body.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(Color::Rgb(220, 220, 220)),
+        )));
+    }
+    body.push(Line::from(""));
+    body.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(" y ", Style::default().fg(Color::Rgb(255, 230, 230)).bg(DANGER).add_modifier(Modifier::BOLD)),
+        Span::styled(" confirm    ", Style::default().fg(Color::Rgb(160, 160, 160))),
+        Span::styled(" n ", Style::default().fg(Color::Rgb(220, 220, 220)).bg(Color::Rgb(60, 60, 60))),
+        Span::styled(" cancel", Style::default().fg(Color::Rgb(160, 160, 160))),
+    ]));
+
+    let rect = centered_rect(width, height, area);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .title(Span::styled(
+                    pending.title.clone(),
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(DANGER))
+                .style(Style::default().bg(Color::Rgb(20, 12, 12))),
+        ),
+        rect,
+    );
 }
 
 fn render_file_panel(
@@ -314,5 +372,88 @@ fn focused_border(focused: bool) -> Style {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::Rgb(50, 50, 50))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Pending, PendingAction};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::path::PathBuf;
+
+    fn app_with_pending() -> App {
+        App {
+            staged_files: Vec::new(),
+            unstaged_files: Vec::new(),
+            staged_sel: 0,
+            unstaged_sel: 0,
+            selected_hunk: 0,
+            diff_scroll: 0,
+            focus: Focus::Unstaged,
+            diff_source: DiffSource::Unstaged,
+            status: String::from("ready"),
+            should_quit: false,
+            pending: Some(Pending {
+                action: PendingAction::DiscardFile,
+                title: String::from(" Confirm discard "),
+                lines: vec![
+                    String::from("Discard all changes in"),
+                    String::from("src/git.rs"),
+                    String::new(),
+                    String::from("This cannot be undone."),
+                ],
+            }),
+            repo_path: PathBuf::from("/nonexistent-the-diff-test"),
+        }
+    }
+
+    /// Draw into an off-screen buffer and flatten it to text.
+    fn rendered(app: &App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_confirm_dialog_is_drawn_over_the_panels() {
+        let out = rendered(&app_with_pending(), 80, 24);
+        assert!(out.contains("Confirm discard"), "missing title:\n{out}");
+        assert!(out.contains("Discard all changes in"), "missing prompt:\n{out}");
+        assert!(out.contains("src/git.rs"), "missing path:\n{out}");
+        assert!(out.contains("This cannot be undone."), "missing warning:\n{out}");
+        assert!(out.contains("confirm"), "missing y hint:\n{out}");
+        assert!(out.contains("cancel"), "missing n hint:\n{out}");
+    }
+
+    #[test]
+    fn no_dialog_is_drawn_when_nothing_is_pending() {
+        let mut app = app_with_pending();
+        app.pending = None;
+        let out = rendered(&app, 80, 24);
+        assert!(!out.contains("Confirm discard"));
+    }
+
+    #[test]
+    fn rendering_survives_a_tiny_terminal() {
+        // The dialog is larger than the screen here; it must clamp, not panic.
+        let _ = rendered(&app_with_pending(), 20, 8);
+    }
+
+    #[test]
+    fn centered_rect_clamps_to_the_available_area() {
+        let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let r = centered_rect(40, 20, area);
+        assert_eq!((r.width, r.height), (10, 4));
+        assert!(r.x + r.width <= area.x + area.width);
+        assert!(r.y + r.height <= area.y + area.height);
     }
 }

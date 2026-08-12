@@ -7,7 +7,10 @@ use std::{io, path::PathBuf, time::{Duration, Instant}};
 use anyhow::{Context, Result};
 use app::{App, Focus};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -50,7 +53,10 @@ fn run(
         terminal.draw(|f| ui::render(f, &app))?;
 
         if !event::poll(Duration::from_millis(200))? {
-            if last_reload.elapsed() >= AUTO_RELOAD {
+            // Never reload while a confirmation is open: reload() resets
+            // selected_hunk, which would silently repoint the pending action at
+            // a different hunk than the one the dialog is asking about.
+            if app.pending.is_none() && last_reload.elapsed() >= AUTO_RELOAD {
                 app.reload();
                 last_reload = Instant::now();
             }
@@ -64,6 +70,22 @@ fn run(
             .map(|s| s.height.saturating_sub(4) as usize)
             .unwrap_or(20);
 
+        // A confirmation dialog is modal: y runs the action, anything else
+        // cancels it, and scroll events are swallowed so the diff underneath
+        // cannot move while the dialog describes a specific hunk.
+        if app.pending.is_some() {
+            match ev {
+                // Press only: on platforms that also report key releases, the
+                // release of the key that opened the dialog would cancel it.
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm(),
+                    _ => app.cancel(),
+                },
+                _ => {}
+            }
+            continue;
+        }
+
         // Mouse scroll anywhere in the window scrolls the diff panel
         if let Event::Mouse(mouse) = ev {
             match mouse.kind {
@@ -76,8 +98,6 @@ fn run(
         }
 
         if let Event::Key(key) = ev {
-            let diff_height = diff_height; // already computed above
-
             match key.code {
                 // Quit
                 KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,

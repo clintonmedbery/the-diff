@@ -17,6 +17,23 @@ pub enum DiffSource {
     Unstaged,
 }
 
+/// An irreversible action waiting on the user to confirm it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingAction {
+    DiscardHunk,
+    DiscardFile,
+}
+
+/// A queued destructive action, plus the text to show in the confirm dialog.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub action: PendingAction,
+    /// Dialog border title, e.g. " Confirm discard "
+    pub title: String,
+    /// Message body, one entry per rendered line
+    pub lines: Vec<String>,
+}
+
 pub struct App {
     pub staged_files: Vec<ChangedFile>,
     pub unstaged_files: Vec<ChangedFile>, // modified tracked + untracked
@@ -29,6 +46,10 @@ pub struct App {
     pub diff_source: DiffSource,
     pub status: String,
     pub should_quit: bool,
+    /// Set while a destructive action awaits confirmation. While this is
+    /// `Some`, the main loop routes every key to confirm/cancel and suppresses
+    /// the idle auto-reload, so the indices captured here stay valid.
+    pub pending: Option<Pending>,
     pub repo_path: PathBuf,
 }
 
@@ -46,6 +67,7 @@ impl App {
             diff_source: DiffSource::Unstaged,
             status: String::from("Tab: cycle panels  q: quit"),
             should_quit: false,
+            pending: None,
             repo_path,
         })
     }
@@ -243,21 +265,73 @@ impl App {
 
     // ── Discard actions (d / D) ──────────────────────────────────────────────
 
-    /// `d`: discard hunk (diff panel) or discard file (unstaged list).
+    /// `d`: ask before discarding a hunk (diff panel) or a file (unstaged list).
     pub fn discard_action(&mut self) {
         match self.focus {
-            Focus::Unstaged => self.discard_file(),
-            Focus::Diff if self.diff_source == DiffSource::Unstaged => self.discard_hunk(),
+            Focus::Unstaged => self.request_discard_file(),
+            Focus::Diff if self.diff_source == DiffSource::Unstaged => self.request_discard_hunk(),
             _ => {}
         }
     }
 
-    /// `D`: discard entire file (unstaged context only).
+    /// `D`: ask before discarding an entire file (unstaged context only).
     pub fn discard_file_action(&mut self) {
         match self.focus {
-            Focus::Unstaged => self.discard_file(),
-            Focus::Diff if self.diff_source == DiffSource::Unstaged => self.discard_file(),
+            Focus::Unstaged => self.request_discard_file(),
+            Focus::Diff if self.diff_source == DiffSource::Unstaged => self.request_discard_file(),
             _ => {}
+        }
+    }
+
+    // ── Confirmation of destructive actions ──────────────────────────────────
+
+    fn request_discard_hunk(&mut self) {
+        let Some(file) = self.unstaged_files.get(self.unstaged_sel) else { return };
+        if self.selected_hunk >= file.hunks.len() { return }
+        self.pending = Some(Pending {
+            action: PendingAction::DiscardHunk,
+            title: String::from(" Confirm discard "),
+            lines: vec![
+                format!("Discard hunk {} of {} in", self.selected_hunk + 1, file.hunks.len()),
+                file.path.clone(),
+                String::new(),
+                String::from("This cannot be undone."),
+            ],
+        });
+    }
+
+    fn request_discard_file(&mut self) {
+        let Some(file) = self.unstaged_files.get(self.unstaged_sel) else { return };
+        let untracked = file.kind == FileKind::Untracked;
+        self.pending = Some(Pending {
+            action: PendingAction::DiscardFile,
+            title: String::from(if untracked { " Confirm delete " } else { " Confirm discard " }),
+            lines: vec![
+                String::from(if untracked {
+                    "Delete untracked file"
+                } else {
+                    "Discard all changes in"
+                }),
+                file.path.clone(),
+                String::new(),
+                String::from("This cannot be undone."),
+            ],
+        });
+    }
+
+    /// `y`: run the pending action.
+    pub fn confirm(&mut self) {
+        let Some(pending) = self.pending.take() else { return };
+        match pending.action {
+            PendingAction::DiscardHunk => self.discard_hunk(),
+            PendingAction::DiscardFile => self.discard_file(),
+        }
+    }
+
+    /// Any other key: dismiss the pending action without running it.
+    pub fn cancel(&mut self) {
+        if self.pending.take().is_some() {
+            self.status = String::from("Cancelled");
         }
     }
 
@@ -348,4 +422,131 @@ fn load_all(repo_path: &std::path::Path) -> (Vec<ChangedFile>, Vec<ChangedFile>)
     let mut unstaged = git::load_diff(repo_path).unwrap_or_default();
     unstaged.extend(git::load_untracked(repo_path).unwrap_or_default());
     (staged, unstaged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::{Hunk, HunkLine, LineKind};
+
+    fn hunk(n: usize) -> Hunk {
+        Hunk {
+            header: format!("@@ -{n},1 +{n},1 @@"),
+            lines: vec![HunkLine {
+                content: String::from("+x"),
+                kind: LineKind::Added,
+            }],
+            old_start: n as u32,
+            new_start: n as u32,
+        }
+    }
+
+    fn changed(path: &str, kind: FileKind, hunks: usize) -> ChangedFile {
+        ChangedFile {
+            path: String::from(path),
+            header: format!("diff --git a/{path} b/{path}"),
+            hunks: (0..hunks).map(hunk).collect(),
+            kind,
+        }
+    }
+
+    /// An App pointed at a path that does not exist, so any git invocation
+    /// fails at spawn instead of mutating a real repository. These tests cover
+    /// the confirmation state machine, not the git calls behind it.
+    fn app(unstaged: Vec<ChangedFile>) -> App {
+        App {
+            staged_files: Vec::new(),
+            unstaged_files: unstaged,
+            staged_sel: 0,
+            unstaged_sel: 0,
+            selected_hunk: 0,
+            diff_scroll: 0,
+            focus: Focus::Unstaged,
+            diff_source: DiffSource::Unstaged,
+            status: String::new(),
+            should_quit: false,
+            pending: None,
+            repo_path: PathBuf::from("/nonexistent-the-diff-test"),
+        }
+    }
+
+    #[test]
+    fn discarding_a_file_asks_first() {
+        let mut a = app(vec![changed("src/git.rs", FileKind::Modified, 2)]);
+        a.discard_action();
+        let p = a.pending.as_ref().expect("expected a confirmation");
+        assert_eq!(p.action, PendingAction::DiscardFile);
+        assert!(p.lines.iter().any(|l| l == "src/git.rs"));
+        assert!(p.lines.iter().any(|l| l.contains("Discard all changes in")));
+    }
+
+    #[test]
+    fn discarding_a_hunk_names_which_hunk() {
+        let mut a = app(vec![changed("src/ui.rs", FileKind::Modified, 3)]);
+        a.focus = Focus::Diff;
+        a.selected_hunk = 1;
+        a.discard_action();
+        let p = a.pending.as_ref().expect("expected a confirmation");
+        assert_eq!(p.action, PendingAction::DiscardHunk);
+        assert!(p.lines.iter().any(|l| l == "Discard hunk 2 of 3 in"));
+    }
+
+    #[test]
+    fn an_untracked_file_is_described_as_a_delete() {
+        let mut a = app(vec![changed("notes.txt", FileKind::Untracked, 1)]);
+        a.discard_action();
+        let p = a.pending.as_ref().expect("expected a confirmation");
+        assert_eq!(p.title.trim(), "Confirm delete");
+        assert!(p.lines.iter().any(|l| l.contains("Delete untracked file")));
+    }
+
+    #[test]
+    fn cancelling_clears_the_pending_action() {
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 1)]);
+        a.discard_action();
+        assert!(a.pending.is_some());
+        a.cancel();
+        assert!(a.pending.is_none());
+        assert_eq!(a.status, "Cancelled");
+    }
+
+    #[test]
+    fn confirming_with_nothing_pending_does_nothing() {
+        let mut a = app(Vec::new());
+        a.confirm();
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn discard_is_unavailable_in_the_staged_panel() {
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 1)]);
+        a.focus = Focus::Staged;
+        a.discard_action();
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn a_hunk_index_past_the_end_asks_nothing() {
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 1)]);
+        a.focus = Focus::Diff;
+        a.selected_hunk = 5;
+        a.discard_action();
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn discard_with_no_files_asks_nothing() {
+        let mut a = app(Vec::new());
+        a.discard_action();
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn staging_is_never_gated_behind_a_confirmation() {
+        // Only irreversible actions confirm; s/S/u/U must stay immediate.
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 1)]);
+        a.focus = Focus::Diff;
+        a.stage_action();
+        assert!(a.pending.is_none());
+    }
 }
