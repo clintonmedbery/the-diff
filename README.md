@@ -1,16 +1,30 @@
 # the-diff
 
+[![CI](https://github.com/clintonmedbery/the-diff/actions/workflows/ci.yml/badge.svg)](https://github.com/clintonmedbery/the-diff/actions/workflows/ci.yml)
+
 A terminal UI for reviewing and staging git changes hunk by hunk.
 
 `the-diff` shows your unstaged and staged changes side by side with the diff, and
 lets you stage, unstage, or discard individual hunks without leaving the
 keyboard. It is a small, focused alternative to `git add -p`.
 
-<!-- TODO: add a screenshot or terminal recording here -->
+![the-diff reviewing its own working tree: unstaged and staged file lists on the left, and a coloured diff with old and new line numbers on the right](docs/screenshot.png)
+
+*the-diff reviewing its own repository — unstaged files top left, staged bottom
+left, and the selected file's hunks on the right.*
 
 ## Install
 
-From source, with a Rust toolchain installed:
+### Prebuilt binaries
+
+Download the archive for your platform from the
+[latest release](https://github.com/clintonmedbery/the-diff/releases/latest),
+extract it, and move `the-diff` somewhere on your `PATH`. Builds are published
+for macOS (Apple silicon and Intel), Linux x86_64, and Windows x86_64.
+
+### From source
+
+With a Rust toolchain installed:
 
 ```sh
 git clone https://github.com/clintonmedbery/the-diff
@@ -18,11 +32,28 @@ cd the-diff
 cargo install --path .
 ```
 
-Or just build and run it in place:
+This installs to `~/.cargo/bin`, which `rustup` already puts on your `PATH`.
+
+### Updating an existing install
+
+The crate version does not change between every build, so `cargo install` will
+refuse to overwrite a copy you already have, reporting that the package is
+already installed. Pass `--force` to replace it:
+
+```sh
+git pull
+cargo install --path . --force
+```
+
+### Running without installing
 
 ```sh
 cargo run --release
 ```
+
+Be aware that this reviews **the-diff's own** working tree, because the binary
+looks for a git repository starting from its working directory. To review a
+different repository, install the binary and run `the-diff` from inside it.
 
 ## Usage
 
