@@ -80,10 +80,10 @@ The screen is split into three panels:
 | Key | Action |
 | --- | --- |
 | `Tab` | Cycle focus: Unstaged → Staged → Diff |
-| `Enter` | Focus the diff panel for the selected file |
-| `Esc` | Leave the diff panel, back to its file list |
-| `↑` / `k` | Move up in a file list, or scroll up in the diff |
-| `↓` / `j` | Move down in a file list, or scroll down in the diff |
+| `Enter` | Go one level deeper: file list → hunks → lines |
+| `Esc` | Come back one level: lines → hunks → file list |
+| `↑` / `k` | Move up in a file list, scroll the diff, or move the line cursor |
+| `↓` / `j` | Move down in a file list, scroll the diff, or move the line cursor |
 | `[` / `]` | Jump to the previous / next hunk |
 | `PageUp` / `PageDown` | Scroll the diff by half a screen |
 | Mouse wheel | Scroll the diff from anywhere in the window |
@@ -109,6 +109,30 @@ Discarding is irreversible, so `d` and `D` open a confirmation dialog. Press `y`
 to go through with it; any other key cancels. For an untracked file, "discard"
 deletes the file from disk.
 
+### Line mode
+
+Press `Enter` again with the diff panel focused to work one line at a time. A
+`▌` cursor marks the current line, the panel title shows `line n/m`, and `↑` /
+`↓` walk through the diff, rolling into the next hunk at each boundary.
+
+| Key | Action | Available in |
+| --- | --- | --- |
+| `d` | Discard the line under the cursor | Unstaged |
+| `u` | Unstage the line under the cursor | Staged |
+| `e` | Open the line in `$VISUAL` / `$EDITOR` | Both |
+| `Esc` | Back to hunk mode | Both |
+
+`e` suspends the TUI, runs your editor at that line, and reloads when it exits.
+The line-jump argument is chosen from the editor's name — `+n` for the vi
+family, nano, and emacs; `-g file:n` for VS Code; `file:n` for Helix, Sublime,
+and Zed; `--line n` for the JetBrains editors. An editor it does not recognise
+just gets the path, so it opens at the top rather than at a bogus line.
+
+Staging a single line is not supported: `s` needs a patch built against the
+index rather than the working tree, which is the opposite of what discarding and
+unstaging need. Pressing `s` in line mode says so instead of quietly staging the
+whole hunk.
+
 The diff auto-reloads after 10 seconds of inactivity, so changes you make in
 your editor show up without pressing `r`.
 
@@ -119,6 +143,12 @@ with `git diff`, `git diff --cached`, and `git ls-files --others`, and it makes
 changes by piping single-hunk patches to `git apply` (with `--cached` to stage
 and `--reverse` to unstage or discard). Whole-file operations use `git add`,
 `git reset HEAD`, and `git checkout HEAD`.
+
+Single-line patches are built the same way, with one wrinkle: the patch has to
+describe the target as it already stands, so the other changes in the hunk are
+rewritten. A sibling addition is already present and becomes a context line; a
+sibling deletion is absent and is left out entirely. Reverse-applying the result
+undoes the one line and nothing else.
 
 This means it has no opinion about your git config, hooks, or version, and
 anything it does is a normal git operation you could have typed yourself.

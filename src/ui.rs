@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::{App, DiffSource, Focus, Pending};
+use crate::app::{App, DiffMode, DiffSource, Focus, Pending};
 use crate::git::{FileKind, LineKind};
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -48,6 +48,43 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(pending) = &app.pending {
         render_confirm(frame, pending, area);
     }
+}
+
+/// Columns a tab advances to in rendered diff content.
+const TAB_WIDTH: usize = 4;
+
+/// Stand-in for a control character that must not reach the terminal.
+const CONTROL_MARKER: char = '·';
+
+/// Make a line of file content safe to place in a terminal cell buffer.
+///
+/// Ratatui treats every character as occupying one cell, but a terminal acts on
+/// control characters: `\t` jumps to the next tab stop and `\r` returns the
+/// cursor to column zero. Either one displaces the rest of the line from where
+/// ratatui believes it is, scrambling the gutter and painting over the borders.
+/// Expand tabs to spaces and swap anything else non-printing for a marker.
+fn sanitize(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    // Column within this line, so tabs land on consistent stops
+    let mut col = 0;
+    for ch in content.chars() {
+        match ch {
+            '\t' => {
+                let advance = TAB_WIDTH - (col % TAB_WIDTH);
+                out.push_str(&" ".repeat(advance));
+                col += advance;
+            }
+            c if c.is_control() => {
+                out.push(CONTROL_MARKER);
+                col += 1;
+            }
+            c => {
+                out.push(c);
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Centre a `width` x `height` box inside `area`, shrinking to fit if needed.
@@ -217,6 +254,7 @@ fn render_file_panel(
 
 fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Diff;
+    let line_mode = app.diff_mode == DiffMode::Line;
     let border_style = focused_border(focused);
 
     let source_label = match app.diff_source {
@@ -233,17 +271,31 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
             ))],
         ),
         Some(file) => {
+            let line_count = file
+                .hunks
+                .get(app.selected_hunk)
+                .map(|h| h.lines.len())
+                .unwrap_or(0);
             let title = format!(
-                " {} [{}]  hunk {}/{} ",
+                " {} [{}]  hunk {}/{}{} ",
                 file.path,
                 source_label,
                 if file.hunks.is_empty() { 0 } else { app.selected_hunk + 1 },
-                file.hunks.len()
+                file.hunks.len(),
+                if line_mode {
+                    format!("  line {}/{}", app.selected_line + 1, line_count)
+                } else {
+                    String::new()
+                }
             );
 
             let mut lines: Vec<Line> = Vec::new();
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 let is_selected = hunk_idx == app.selected_hunk;
+
+                // In line mode the cursor row carries the emphasis, so the
+                // hunk-wide highlight steps back to avoid competing with it.
+                let hunk_lit = is_selected && !line_mode;
 
                 // Hunk header
                 let (hdr_fg, hdr_bg) = if is_selected {
@@ -253,26 +305,17 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
                 };
                 let mut hdr_line = Line::from(vec![
                     Span::styled("         ", Style::default().bg(hdr_bg)),
-                    Span::styled(hunk.header.clone(), Style::default().fg(hdr_fg).bg(hdr_bg)),
+                    // Hunk headers carry a context line, which can hold tabs
+                    Span::styled(sanitize(&hunk.header), Style::default().fg(hdr_fg).bg(hdr_bg)),
                 ]);
                 hdr_line.style = Style::default().bg(hdr_bg);
                 lines.push(hdr_line);
 
-                let mut old_line = hunk.old_start;
-                let mut new_line = hunk.new_start;
-
-                for dl in &hunk.lines {
-                    let (old_num, new_num) = match dl.kind {
-                        LineKind::Added => { let n = new_line; new_line += 1; (None, Some(n)) }
-                        LineKind::Removed => { let n = old_line; old_line += 1; (Some(n), None) }
-                        LineKind::Context => {
-                            let (o, n) = (old_line, new_line);
-                            old_line += 1; new_line += 1;
-                            (Some(o), Some(n))
-                        }
-                        LineKind::NoNewline => (None, None),
-                    };
-
+                for (line_idx, (dl, (old_num, new_num))) in
+                    hunk.lines.iter().zip(hunk.numbering()).enumerate()
+                {
+                    let on_cursor = line_mode && is_selected && line_idx == app.selected_line;
+                    let is_selected = hunk_lit || on_cursor;
                     let (bg, fg_code, fg_text) = match dl.kind {
                         LineKind::Added => (
                             if is_selected { Color::Rgb(0, 45, 0) } else { Color::Rgb(0, 25, 0) },
@@ -292,6 +335,7 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
                         LineKind::NoNewline => (Color::Reset, Color::Rgb(150, 120, 0), Color::Rgb(200, 170, 0)),
                     };
 
+                    let bg = if on_cursor { lift(bg) } else { bg };
                     let num_style = Style::default()
                         .fg(if is_selected { Color::Rgb(90, 90, 90) } else { Color::Rgb(50, 50, 50) })
                         .bg(bg);
@@ -299,13 +343,22 @@ fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
                     let old_str = old_num.map(|n| format!("{n:>4}")).unwrap_or_else(|| "    ".into());
                     let new_str = new_num.map(|n| format!("{n:>4}")).unwrap_or_else(|| "    ".into());
                     let sign = match dl.kind { LineKind::Added => "+", LineKind::Removed => "-", _ => " " };
-                    let content = dl.content.get(1..).unwrap_or(&dl.content).to_string();
+                    let content = sanitize(dl.content.get(1..).unwrap_or(&dl.content));
 
                     let mut line = Line::from(vec![
                         Span::styled(old_str, num_style),
                         Span::styled(" ", Style::default().bg(bg)),
                         Span::styled(new_str, num_style),
-                        Span::styled(" │ ", Style::default().fg(Color::Rgb(45, 45, 45)).bg(bg)),
+                        Span::styled(
+                            if on_cursor { " ▌ " } else { " │ " },
+                            Style::default()
+                                .fg(if on_cursor {
+                                    Color::Rgb(120, 200, 255)
+                                } else {
+                                    Color::Rgb(45, 45, 45)
+                                })
+                                .bg(bg),
+                        ),
                         Span::styled(sign, Style::default().fg(fg_code).bg(bg)),
                         Span::styled(" ", Style::default().bg(bg)),
                         Span::styled(content, Style::default().fg(fg_text).bg(bg)),
@@ -351,20 +404,41 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     // Context-sensitive help
+    let line_mode = app.diff_mode == DiffMode::Line;
+    let staged = app.diff_source == DiffSource::Staged;
     let help = match &app.focus {
         Focus::Unstaged =>
             " Tab:cycle  ↑↓/jk:nav  s:stage file  d:discard  Enter:diff  r:reload  q:quit",
         Focus::Staged =>
             " Tab:cycle  ↑↓/jk:nav  u:unstage file  Enter:diff  r:reload  q:quit",
-        Focus::Diff if app.diff_source == DiffSource::Staged =>
-            " Tab:panel  ↑↓/jk:scroll  []:hunk  u:unstage hunk  U:unstage file  r:reload  q:quit",
+        Focus::Diff if line_mode && staged =>
+            " ↑↓/jk:line  u:unstage line  e:edit  Esc:hunks  r:reload  q:quit",
+        Focus::Diff if line_mode =>
+            " ↑↓/jk:line  d:discard line  e:edit  Esc:hunks  r:reload  q:quit",
+        Focus::Diff if staged =>
+            " Tab:panel  ↑↓/jk:scroll  []:hunk  Enter:lines  u:unstage hunk  U:unstage file  r:reload  q:quit",
         Focus::Diff =>
-            " Tab:panel  ↑↓/jk:scroll  []:hunk  s:stage hunk  S:stage file  d:discard hunk  D:discard file  r:reload  q:quit",
+            " Tab:panel  ↑↓/jk:scroll  []:hunk  Enter:lines  s:stage hunk  S:stage file  d:discard hunk  D:discard file  r:reload  q:quit",
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::Rgb(70, 70, 70))),
         rows[1],
     );
+}
+
+/// Brighten a row background so the line cursor stands out while still
+/// reading as an addition, a deletion, or context.
+fn lift(bg: Color) -> Color {
+    const FLOOR: u8 = 38;
+    match bg {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            r.saturating_add(FLOOR),
+            g.saturating_add(FLOOR),
+            b.saturating_add(FLOOR),
+        ),
+        // Context rows have no colour of their own
+        _ => Color::Rgb(FLOOR, FLOOR, FLOOR),
+    }
 }
 
 fn focused_border(focused: bool) -> Style {
@@ -389,8 +463,10 @@ mod tests {
             staged_sel: 0,
             unstaged_sel: 0,
             selected_hunk: 0,
+            selected_line: 0,
             diff_scroll: 0,
             focus: Focus::Unstaged,
+            diff_mode: DiffMode::Hunk,
             diff_source: DiffSource::Unstaged,
             status: String::from("ready"),
             should_quit: false,
@@ -404,6 +480,7 @@ mod tests {
                     String::from("This cannot be undone."),
                 ],
             }),
+            editor_request: None,
             repo_path: PathBuf::from("/nonexistent-the-diff-test"),
         }
     }
@@ -446,6 +523,144 @@ mod tests {
     fn rendering_survives_a_tiny_terminal() {
         // The dialog is larger than the screen here; it must clamp, not panic.
         let _ = rendered(&app_with_pending(), 20, 8);
+    }
+
+    /// An App showing a single unstaged file whose hunk holds `lines`.
+    fn app_showing(hunk_header: &str, lines: &[&str]) -> App {
+        use crate::git::{ChangedFile, FileKind, Hunk, HunkLine, LineKind};
+        let mut app = app_with_pending();
+        app.pending = None;
+        app.focus = Focus::Diff;
+        app.unstaged_files = vec![ChangedFile {
+            path: String::from("probe.txt"),
+            header: String::from("diff --git a/probe.txt b/probe.txt"),
+            hunks: vec![Hunk {
+                header: String::from(hunk_header),
+                lines: lines
+                    .iter()
+                    .map(|l| HunkLine {
+                        content: l.to_string(),
+                        kind: LineKind::Added,
+                    })
+                    .collect(),
+                old_start: 1,
+                new_start: 1,
+            }],
+            kind: FileKind::Modified,
+        }];
+        app
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_terminal() {
+        // A tab or carriage return occupies one buffer cell as far as ratatui
+        // is concerned, but a real terminal acts on it: \t jumps to the next
+        // tab stop and \r returns to column zero, displacing everything after
+        // it on the line and painting over the borders.
+        let app = app_showing(
+            "@@ -1,5 +1,5 @@\tcontext\twith\ttabs",
+            &[
+                "+\tone tab",
+                "+carriage\rreturn",
+                "+form\u{000c}feed",
+                "+escape\u{001b}[31m sequence",
+            ],
+        );
+        let out = rendered(&app, 70, 14);
+        let offenders: Vec<char> = out
+            .chars()
+            .filter(|c| c.is_control() && *c != '\n')
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "control characters reached the buffer: {offenders:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn tabs_expand_to_four_column_stops() {
+        let app = app_showing("@@ -1,2 +1,2 @@", &["+\tone", "+ab\tcd"]);
+        let out = rendered(&app, 70, 14);
+        // Tab at column 0 fills 4 columns
+        assert!(out.contains("    one"), "{out}");
+        // Tab after two characters fills the remaining 2 of that stop
+        assert!(out.contains("ab  cd"), "{out}");
+    }
+
+    #[test]
+    fn other_control_characters_render_as_a_visible_marker() {
+        let app = app_showing("@@ -1,1 +1,1 @@", &["+carriage\rreturn"]);
+        let out = rendered(&app, 70, 14);
+        assert!(out.contains("carriage·return"), "{out}");
+    }
+
+    // ── Line mode ────────────────────────────────────────────────────────────
+
+    /// The rendered row containing `needle`.
+    fn row_with<'a>(out: &'a str, needle: &str) -> &'a str {
+        out.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{out}"))
+    }
+
+    fn app_in_line_mode(cursor: usize) -> App {
+        let mut app = app_showing("@@ -1,3 +1,3 @@", &["+one", "+two", "+three"]);
+        app.diff_mode = DiffMode::Line;
+        app.selected_line = cursor;
+        app
+    }
+
+    #[test]
+    fn the_line_under_the_cursor_is_marked() {
+        let out = rendered(&app_in_line_mode(1), 70, 14);
+        assert!(row_with(&out, "two").contains('▌'), "{out}");
+    }
+
+    #[test]
+    fn other_lines_are_not_marked() {
+        let out = rendered(&app_in_line_mode(1), 70, 14);
+        assert!(!row_with(&out, "one").contains('▌'), "{out}");
+        assert!(!row_with(&out, "three").contains('▌'), "{out}");
+    }
+
+    #[test]
+    fn hunk_mode_marks_no_line_at_all() {
+        let mut app = app_in_line_mode(1);
+        app.diff_mode = DiffMode::Hunk;
+        let out = rendered(&app, 70, 14);
+        assert!(!out.contains('▌'), "{out}");
+    }
+
+    #[test]
+    fn the_title_counts_lines_in_line_mode() {
+        let out = rendered(&app_in_line_mode(1), 70, 14);
+        assert!(out.contains("line 2/3"), "{out}");
+    }
+
+    #[test]
+    fn the_title_omits_the_line_count_in_hunk_mode() {
+        let mut app = app_in_line_mode(1);
+        app.diff_mode = DiffMode::Hunk;
+        let out = rendered(&app, 70, 14);
+        assert!(!out.contains("line 2/3"), "{out}");
+    }
+
+    #[test]
+    fn line_mode_help_offers_the_line_actions() {
+        let out = rendered(&app_in_line_mode(1), 110, 14);
+        assert!(out.contains("d:discard line"), "{out}");
+        assert!(out.contains("e:edit"), "{out}");
+    }
+
+    #[test]
+    fn line_mode_help_in_the_staged_diff_offers_unstaging() {
+        let mut app = app_in_line_mode(1);
+        app.staged_files = app.unstaged_files.clone();
+        app.unstaged_files = Vec::new();
+        app.diff_source = DiffSource::Staged;
+        let out = rendered(&app, 110, 14);
+        assert!(out.contains("u:unstage line"), "{out}");
+        assert!(!out.contains("d:discard line"), "{out}");
     }
 
     #[test]
