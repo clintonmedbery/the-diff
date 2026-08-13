@@ -74,12 +74,27 @@ impl App {
 
     pub fn reload(&mut self) {
         let (staged, unstaged) = load_all(&self.repo_path);
+        self.apply_reload(staged, unstaged);
+    }
+
+    /// Swap in freshly loaded file lists. Split out from `reload` so the view
+    /// bookkeeping can be tested without a repository on disk.
+    fn apply_reload(&mut self, staged: Vec<ChangedFile>, unstaged: Vec<ChangedFile>) {
         self.staged_files = staged;
         self.unstaged_files = unstaged;
         self.staged_sel = self.staged_sel.min(self.staged_files.len().saturating_sub(1));
-        self.unstaged_sel = self.unstaged_sel.min(self.unstaged_files.len().saturating_sub(1));
-        self.selected_hunk = 0;
-        self.diff_scroll = 0;
+        self.unstaged_sel = self
+            .unstaged_sel
+            .min(self.unstaged_files.len().saturating_sub(1));
+
+        // Keep the reader where they were. The idle reload fires every ten
+        // seconds, which is exactly when someone is sitting still reading a
+        // scrolled diff, so resetting to the top here loses their place.
+        // Preserve the hunk and scroll offset, clamped to what still exists.
+        let hunk_count = self.current_file().map(|f| f.hunks.len()).unwrap_or(0);
+        self.selected_hunk = self.selected_hunk.min(hunk_count.saturating_sub(1));
+        let total = self.total_diff_lines();
+        self.diff_scroll = self.diff_scroll.min(total.saturating_sub(1));
     }
 
     /// The file whose diff is currently shown in the right panel.
@@ -539,6 +554,40 @@ mod tests {
         let mut a = app(Vec::new());
         a.discard_action();
         assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn reloading_keeps_the_reader_in_place() {
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 3)]);
+        a.focus = Focus::Diff;
+        a.selected_hunk = 2;
+        a.diff_scroll = 4;
+        // Nothing about the file changed between loads
+        a.apply_reload(Vec::new(), vec![changed("a.rs", FileKind::Modified, 3)]);
+        assert_eq!(a.selected_hunk, 2, "hunk selection should survive a reload");
+        assert_eq!(a.diff_scroll, 4, "scroll position should survive a reload");
+    }
+
+    #[test]
+    fn reloading_clamps_the_view_when_the_diff_shrinks() {
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 3)]);
+        a.focus = Focus::Diff;
+        a.selected_hunk = 2;
+        a.diff_scroll = 5;
+        // Down to one hunk: 1 header + 1 line = 2 rendered lines
+        a.apply_reload(Vec::new(), vec![changed("a.rs", FileKind::Modified, 1)]);
+        assert_eq!(a.selected_hunk, 0, "hunk 2 no longer exists");
+        assert!(a.diff_scroll <= 1, "scroll {} is past the new end", a.diff_scroll);
+    }
+
+    #[test]
+    fn reloading_an_empty_tree_resets_the_view() {
+        let mut a = app(vec![changed("a.rs", FileKind::Modified, 3)]);
+        a.selected_hunk = 2;
+        a.diff_scroll = 4;
+        a.apply_reload(Vec::new(), Vec::new());
+        assert_eq!(a.selected_hunk, 0);
+        assert_eq!(a.diff_scroll, 0);
     }
 
     #[test]
